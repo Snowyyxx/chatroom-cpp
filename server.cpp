@@ -1,195 +1,181 @@
+// server.cpp
 #include <bits/stdc++.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <errno.h>
-#include <string.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <thread>
 #include <mutex>
-#define MAX_LEN 200
-#define NUM_COLORS 6
+
+#include "commands.h"
+#include "server_types.h"
 
 using namespace std;
 
-struct terminal
-{
-	int id;
-	string name;
-	int socket;
-	thread th;
+// globals (also declared extern in server_types.h)
+const int MAX_LEN    = 200;
+const int NUM_COLORS = 6;
+const string def_col = "\033[0m";
+const string colors[NUM_COLORS] = {
+    "\033[31m", "\033[32m", "\033[33m",
+    "\033[34m", "\033[35m", "\033[36m"
 };
 
-vector<terminal> clients;
-string def_col="\033[0m";
-string colors[]={"\033[31m", "\033[32m", "\033[33m", "\033[34m", "\033[35m","\033[36m"};
-int seed=0;
-mutex cout_mtx,clients_mtx;
+vector<ClientInfo> clients;
+mutex clients_mtx, cout_mtx;
+int seed = 0;
 
-string color(int code);
-void set_name(int id, char name[]);
-void shared_print(string str, bool endLine);
-int broadcast_message(string message, int sender_id);
-int broadcast_message(int num, int sender_id);
+// forward declarations
+int  get_client_index(int id);
+void shared_print(const string& str, bool endLine=true);
+int  broadcast_message(const string& message, int sender_id);
+int  broadcast_message(int num, int sender_id);
 void end_connection(int id);
 void handle_client(int client_socket, int id);
 
-int main()
-{
-	int server_socket;
-	if((server_socket=socket(AF_INET,SOCK_STREAM,0))==-1)
-	{
-		perror("socket: ");
-		exit(-1);
-	}
+int main() {
+    // Prepare command subsystem
+    Commands_Init();
 
-	struct sockaddr_in server;
-	server.sin_family=AF_INET;
-	server.sin_port=htons(10000);
-	server.sin_addr.s_addr=INADDR_ANY;
-	bzero(&server.sin_zero,0);
+    // 1) set up listening socket
+    int server_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_sock == -1) { perror("socket"); exit(-1); }
 
-	if((bind(server_socket,(struct sockaddr *)&server,sizeof(struct sockaddr_in)))==-1)
-	{
-		perror("bind error: ");
-		exit(-1);
-	}
+    sockaddr_in srv_addr{};
+    srv_addr.sin_family      = AF_INET;
+    srv_addr.sin_port        = htons(10000);
+    srv_addr.sin_addr.s_addr = INADDR_ANY;
+    bzero(&srv_addr.sin_zero, 0);
 
-	if((listen(server_socket,8))==-1)
-	{
-		perror("listen error: ");
-		exit(-1);
-	}
+    if (bind(server_sock, (sockaddr*)&srv_addr, sizeof(srv_addr)) == -1) {
+        perror("bind"); exit(-1);
+    }
+    if (listen(server_sock, 8) == -1) {
+        perror("listen"); exit(-1);
+    }
 
-	struct sockaddr_in client;
-	int client_socket;
-	unsigned int len=sizeof(sockaddr_in);
+    cout << colors[NUM_COLORS-1]
+         << "\n\t  ====== Welcome to the chat-room ======   "
+         << def_col << endl;
 
-	cout<<colors[NUM_COLORS-1]<<"\n\t  ====== Welcome to the chat-room ======   "<<endl<<def_col;
+    // 2) accept loop
+    while (true) {
+        sockaddr_in cli_addr{};
+        socklen_t    len = sizeof(cli_addr);
+        int client_sock = accept(server_sock,
+                                 (sockaddr*)&cli_addr, &len);
+        if (client_sock == -1) {
+            perror("accept"); continue;
+        }
+        seed++;
+        thread t(handle_client, client_sock, seed);
 
-	while(1)
-	{
-		if((client_socket=accept(server_socket,(struct sockaddr *)&client,&len))==-1)
-		{
-			perror("accept error: ");
-			exit(-1);
-		}
-		seed++;
-		thread t(handle_client,client_socket,seed);
-		lock_guard<mutex> guard(clients_mtx);
-		clients.push_back({seed, string("Anonymous"),client_socket,(move(t))});
-	}
+        lock_guard<mutex> guard(clients_mtx);
+        clients.push_back({ seed,
+                            "Anonymous",
+                            client_sock,
+                            move(t),
+                            (seed-1) % NUM_COLORS });
+    }
 
-	for(int i=0; i<clients.size(); i++)
-	{
-		if(clients[i].th.joinable())
-			clients[i].th.join();
-	}
-
-	close(server_socket);
-	return 0;
+    close(server_sock);
+    return 0;
 }
 
-string color(int code)
-{
-	return colors[code%NUM_COLORS];
+int get_client_index(int id) {
+    lock_guard<mutex> guard(clients_mtx);
+    for (int i = 0; i < (int)clients.size(); i++)
+        if (clients[i].id == id) return i;
+    return -1;
 }
 
-// Set name of client
-void set_name(int id, char name[])
-{
-	for(int i=0; i<clients.size(); i++)
-	{
-			if(clients[i].id==id)	
-			{
-				clients[i].name=string(name);
-			}
-	}	
+void shared_print(const string& str, bool endLine) {
+    lock_guard<mutex> guard(cout_mtx);
+    cout << str;
+    if (endLine) cout << endl;
 }
 
-// For synchronisation of cout statements
-void shared_print(string str, bool endLine=true)
-{	
-	lock_guard<mutex> guard(cout_mtx);
-	cout<<str;
-	if(endLine)
-			cout<<endl;
+int broadcast_message(const string& message, int sender_id) {
+    char buf[MAX_LEN] = {0};
+    strncpy(buf, message.c_str(), MAX_LEN - 1);
+    for (auto& c : clients) {
+        if (c.id != sender_id)
+            send(c.socket, buf, MAX_LEN, 0);
+    }
+    return 0;
 }
 
-// Broadcast message to all clients except the sender
-int broadcast_message(string message, int sender_id)
-{
-	char temp[MAX_LEN];
-	strcpy(temp,message.c_str());
-	for(int i=0; i<clients.size(); i++)
-	{
-		if(clients[i].id!=sender_id)
-		{
-			send(clients[i].socket,temp,sizeof(temp),0);
-		}
-	}		
+int broadcast_message(int num, int sender_id) {
+    for (auto& c : clients) {
+        if (c.id != sender_id)
+            send(c.socket, &num, sizeof(num), 0);
+    }
+    return 0;
 }
 
-// Broadcast a number to all clients except the sender
-int broadcast_message(int num, int sender_id)
-{
-	for(int i=0; i<clients.size(); i++)
-	{
-		if(clients[i].id!=sender_id)
-		{
-			send(clients[i].socket,&num,sizeof(num),0);
-		}
-	}		
+void end_connection(int id) {
+    lock_guard<mutex> guard(clients_mtx);
+    for (auto it = clients.begin(); it != clients.end(); ++it) {
+        if (it->id == id) {
+            it->th.detach();
+            close(it->socket);
+            clients.erase(it);
+            break;
+        }
+    }
 }
 
-void end_connection(int id)
-{
-	for(int i=0; i<clients.size(); i++)
-	{
-		if(clients[i].id==id)	
-		{
-			lock_guard<mutex> guard(clients_mtx);
-			clients[i].th.detach();
-			clients.erase(clients.begin()+i);
-			close(clients[i].socket);
-			break;
-		}
-	}				
-}
+void handle_client(int client_socket, int id) {
+    char name_buf[MAX_LEN], str_buf[MAX_LEN];
+    // 1) initial name
+    recv(client_socket, name_buf, MAX_LEN, 0);
+    {
+        lock_guard<mutex> guard(clients_mtx);
+        int idx = get_client_index(id);
+        if (idx >= 0) clients[idx].name = name_buf;
+    }
+    int idx = get_client_index(id);
+    int my_col = clients[idx].color_code;
+    string join_msg = clients[idx].name + " has joined";
 
-void handle_client(int client_socket, int id)
-{
-	char name[MAX_LEN],str[MAX_LEN];
-	recv(client_socket,name,sizeof(name),0);
-	set_name(id,name);	
+    broadcast_message("#NULL", id);
+    broadcast_message(my_col, id);
+    broadcast_message(join_msg, id);
+    shared_print(colors[my_col] + join_msg + def_col);
 
-	// Display welcome message
-	string welcome_message=string(name)+string(" has joined");
-	broadcast_message("#NULL",id);	
-	broadcast_message(id,id);								
-	broadcast_message(welcome_message,id);	
-	shared_print(color(id)+welcome_message+def_col);
-	
-	while(1)
-	{
-		int bytes_received=recv(client_socket,str,sizeof(str),0);
-		if(bytes_received<=0)
-			return;
-		if(strcmp(str,"#exit")==0)
-		{
-			// Display leaving message
-			string message=string(name)+string(" has left");		
-			broadcast_message("#NULL",id);			
-			broadcast_message(id,id);						
-			broadcast_message(message,id);
-			shared_print(color(id)+message+def_col);
-			end_connection(id);							
-			return;
-		}
-		broadcast_message(string(name),id);					
-		broadcast_message(id,id);		
-		broadcast_message(string(str),id);
-		shared_print(color(id)+name+" : "+def_col+str);		
-	}	
+    // 2) message loop
+    while (true) {
+        int bytes = recv(client_socket, str_buf, MAX_LEN, 0);
+        if (bytes <= 0) {
+            end_connection(id);
+            return;
+        }
+        string msg(str_buf);
+
+        if (msg == "#exit") {
+            string leave = clients[idx].name + " has left";
+            broadcast_message("#NULL", id);
+            broadcast_message(my_col, id);
+            broadcast_message(leave, id);
+            shared_print(colors[my_col] + leave + def_col);
+            end_connection(id);
+            return;
+        }
+
+        // Slash‐commands
+        if (!msg.empty() && msg[0] == '/') {
+            if (Commands_Handle(msg, id))
+                continue;
+        }
+
+        // Normal broadcast
+        idx   = get_client_index(id);
+        my_col = clients[idx].color_code;
+        broadcast_message(clients[idx].name, id);
+        broadcast_message(my_col,             id);
+        broadcast_message(msg,               id);
+        shared_print(colors[my_col] + clients[idx].name
+                     + " : " + def_col + msg);
+    }
 }
