@@ -1,24 +1,11 @@
-# Chatroom Application
+## About This Project
 
-A chatroom built in C++ using the concepts of socket programming and multi-threading. It supports chatting among multiple clients.
+This is a C++ chatroom system built using sockets and multithreading.
 
-![](/screenshot.png)
-## How to run
+👉 Forked from [cjchirag7/chatroom-cpp](https://github.com/cjchirag7/chatroom-cpp), and extended with the following features:
 
-1. Clone this repository
-2. Run the following commands in your terminal :
-```
-g++ server.cpp -lpthread -o server
-g++ client.cpp -lpthread -o client
-```
-3. To run the server application, use this command in the terminal :
-```
-./server
-```
+- Added XYZ feature (e.g. encryption, command handling, etc.)
+- Improved error handling / multithreaded behavior
+- Enhanced user experience / documentation
 
-4. Now, open another terminal and use this command to run the client application :
-```
-./client
-```
-
-5. For opening multiple client applications, repeat step 4.
+This was done as part of a networking project during [Your College Name]'s placement process.
