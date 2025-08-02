@@ -8,4 +8,4 @@ This is a C++ chatroom system built using sockets and multithreading.
 - Improved error handling / multithreaded behavior
 - Enhanced user experience / documentation
 
-This was done as part of a networking project during [Your College Name]'s placement process.
+This was done as part of a networking project during Thapar's placement process.
