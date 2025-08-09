@@ -1,14 +1,12 @@
-// commands.h
 #ifndef COMMANDS_H
 #define COMMANDS_H
 
+#include "server_types.h"
 #include <string>
+#include <vector>
+#include <mutex>
 
-// Call once at server startup
-void Commands_Init();
+void processCommand(const std::string& cmd, int senderFd,
+                    std::vector<ClientInfo>& clients, std::mutex& clientsMutex);
 
-// Try to handle a leading-‘/’ command from client `sender_id`.
-// Returns true if handled (and no further broadcast is needed).
-bool Commands_Handle(const std::string& input, int sender_id);
-
-#endif // COMMANDS_H
+#endif

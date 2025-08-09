@@ -1,181 +1,205 @@
-// server.cpp
-#include <bits/stdc++.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <thread>
-#include <mutex>
-
-#include "commands.h"
 #include "server_types.h"
+#include "commands.h"
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <pthread.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <cstring>
+#include <iostream>
+#include <vector>
+#include <string>
+#include <fstream>
+#include <mutex>
+#include <queue>
 
-using namespace std;
+#define MAX_CLIENTS 50
+#define BUFFER_SIZE 1024
+#define SERVER_PORT 5000
 
-// globals (also declared extern in server_types.h)
-const int MAX_LEN    = 200;
-const int NUM_COLORS = 6;
-const string def_col = "\033[0m";
-const string colors[NUM_COLORS] = {
-    "\033[31m", "\033[32m", "\033[33m",
-    "\033[34m", "\033[35m", "\033[36m"
-};
+std::vector<ClientInfo> clients;
+std::mutex clientsMutex;
 
-vector<ClientInfo> clients;
-mutex clients_mtx, cout_mtx;
-int seed = 0;
+// Logging queue + mutex
+std::queue<std::string> logQueue;
+std::mutex logMutex;
+bool running = true;
 
-// forward declarations
-int  get_client_index(int id);
-void shared_print(const string& str, bool endLine=true);
-int  broadcast_message(const string& message, int sender_id);
-int  broadcast_message(int num, int sender_id);
-void end_connection(int id);
-void handle_client(int client_socket, int id);
-
-int main() {
-    // Prepare command subsystem
-    Commands_Init();
-
-    // 1) set up listening socket
-    int server_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_sock == -1) { perror("socket"); exit(-1); }
-
-    sockaddr_in srv_addr{};
-    srv_addr.sin_family      = AF_INET;
-    srv_addr.sin_port        = htons(10000);
-    srv_addr.sin_addr.s_addr = INADDR_ANY;
-    bzero(&srv_addr.sin_zero, 0);
-
-    if (bind(server_sock, (sockaddr*)&srv_addr, sizeof(srv_addr)) == -1) {
-        perror("bind"); exit(-1);
-    }
-    if (listen(server_sock, 8) == -1) {
-        perror("listen"); exit(-1);
+void* loggingThread(void* arg) {
+    std::ofstream logFile("chatroom.log", std::ios::app);
+    if (!logFile.is_open()) {
+        std::cerr << "[ERROR] Could not open log file.\n";
+        return nullptr;
     }
 
-    cout << colors[NUM_COLORS-1]
-         << "\n\t  ====== Welcome to the chat-room ======   "
-         << def_col << endl;
-
-    // 2) accept loop
-    while (true) {
-        sockaddr_in cli_addr{};
-        socklen_t    len = sizeof(cli_addr);
-        int client_sock = accept(server_sock,
-                                 (sockaddr*)&cli_addr, &len);
-        if (client_sock == -1) {
-            perror("accept"); continue;
+    while (running) {
+        std::string entry;
+        {
+            std::lock_guard<std::mutex> lock(logMutex);
+            if (!logQueue.empty()) {
+                entry = logQueue.front();
+                logQueue.pop();
+            }
         }
-        seed++;
-        thread t(handle_client, client_sock, seed);
-
-        lock_guard<mutex> guard(clients_mtx);
-        clients.push_back({ seed,
-                            "Anonymous",
-                            client_sock,
-                            move(t),
-                            (seed-1) % NUM_COLORS });
+        if (!entry.empty()) {
+            logFile << entry << std::endl;
+            logFile.flush();
+        }
+        usleep(10000); // 10ms
     }
-
-    close(server_sock);
-    return 0;
+    logFile.close();
+    return nullptr;
 }
 
-int get_client_index(int id) {
-    lock_guard<mutex> guard(clients_mtx);
-    for (int i = 0; i < (int)clients.size(); i++)
-        if (clients[i].id == id) return i;
-    return -1;
-}
-
-void shared_print(const string& str, bool endLine) {
-    lock_guard<mutex> guard(cout_mtx);
-    cout << str;
-    if (endLine) cout << endl;
-}
-
-int broadcast_message(const string& message, int sender_id) {
-    char buf[MAX_LEN] = {0};
-    strncpy(buf, message.c_str(), MAX_LEN - 1);
-    for (auto& c : clients) {
-        if (c.id != sender_id)
-            send(c.socket, buf, MAX_LEN, 0);
+void broadcastMessage(const std::string& msg, int senderFd) {
+    std::lock_guard<std::mutex> lock(clientsMutex);
+    for (auto& client : clients) {
+        if (client.fd != senderFd) {
+            send(client.fd, msg.c_str(), msg.size(), 0);
+        }
     }
-    return 0;
 }
 
-int broadcast_message(int num, int sender_id) {
-    for (auto& c : clients) {
-        if (c.id != sender_id)
-            send(c.socket, &num, sizeof(num), 0);
-    }
-    return 0;
-}
-
-void end_connection(int id) {
-    lock_guard<mutex> guard(clients_mtx);
+void removeClient(int fd) {
+    std::lock_guard<std::mutex> lock(clientsMutex);
     for (auto it = clients.begin(); it != clients.end(); ++it) {
-        if (it->id == id) {
-            it->th.detach();
-            close(it->socket);
+        if (it->fd == fd) {
+            close(it->fd);
             clients.erase(it);
             break;
         }
     }
 }
 
-void handle_client(int client_socket, int id) {
-    char name_buf[MAX_LEN], str_buf[MAX_LEN];
-    // 1) initial name
-    recv(client_socket, name_buf, MAX_LEN, 0);
-    {
-        lock_guard<mutex> guard(clients_mtx);
-        int idx = get_client_index(id);
-        if (idx >= 0) clients[idx].name = name_buf;
+int main() {
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        perror("[ERROR] Socket creation failed");
+        return 1;
     }
-    int idx = get_client_index(id);
-    int my_col = clients[idx].color_code;
-    string join_msg = clients[idx].name + " has joined";
 
-    broadcast_message("#NULL", id);
-    broadcast_message(my_col, id);
-    broadcast_message(join_msg, id);
-    shared_print(colors[my_col] + join_msg + def_col);
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    // 2) message loop
+    sockaddr_in serverAddr{};
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_addr.s_addr = INADDR_ANY;
+    serverAddr.sin_port = htons(SERVER_PORT);
+
+    if (bind(server_fd, (sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
+        perror("[ERROR] Bind failed");
+        return 1;
+    }
+
+    if (listen(server_fd, 5) < 0) {
+        perror("[ERROR] Listen failed");
+        return 1;
+    }
+
+    std::cout << "[INFO] Server started on port " << SERVER_PORT << "\n";
+
+    // Start logging thread
+    pthread_t logThread;
+    pthread_create(&logThread, nullptr, loggingThread, nullptr);
+
+    struct pollfd fds[MAX_CLIENTS + 1];
+    fds[0].fd = server_fd;
+    fds[0].events = POLLIN;
+
+    int nfds = 1;
+
     while (true) {
-        int bytes = recv(client_socket, str_buf, MAX_LEN, 0);
-        if (bytes <= 0) {
-            end_connection(id);
-            return;
-        }
-        string msg(str_buf);
-
-        if (msg == "#exit") {
-            string leave = clients[idx].name + " has left";
-            broadcast_message("#NULL", id);
-            broadcast_message(my_col, id);
-            broadcast_message(leave, id);
-            shared_print(colors[my_col] + leave + def_col);
-            end_connection(id);
-            return;
+        int activity = poll(fds, nfds, -1);
+        if (activity < 0) {
+            perror("[ERROR] poll() failed");
+            break;
         }
 
-        // Slash‐commands
-        if (!msg.empty() && msg[0] == '/') {
-            if (Commands_Handle(msg, id))
+        // New connection
+        if (fds[0].revents & POLLIN) {
+            sockaddr_in clientAddr{};
+            socklen_t clientLen = sizeof(clientAddr);
+            int newFd = accept(server_fd, (sockaddr*)&clientAddr, &clientLen);
+            if (newFd < 0) {
+                perror("[ERROR] accept() failed");
                 continue;
+            }
+
+            std::string welcome = "Welcome to Chatroom!\n";
+            send(newFd, welcome.c_str(), welcome.size(), 0);
+
+            {
+                std::lock_guard<std::mutex> lock(clientsMutex);
+                clients.push_back({newFd, "User" + std::to_string(newFd), 0});
+            }
+
+            fds[nfds].fd = newFd;
+            fds[nfds].events = POLLIN;
+            nfds++;
+
+            std::string logEntry = "[CONNECT] Client FD " + std::to_string(newFd) + " joined.";
+            {
+                std::lock_guard<std::mutex> lock(logMutex);
+                logQueue.push(logEntry);
+            }
         }
 
-        // Normal broadcast
-        idx   = get_client_index(id);
-        my_col = clients[idx].color_code;
-        broadcast_message(clients[idx].name, id);
-        broadcast_message(my_col,             id);
-        broadcast_message(msg,               id);
-        shared_print(colors[my_col] + clients[idx].name
-                     + " : " + def_col + msg);
+        // Client messages
+        for (int i = 1; i < nfds; ++i) {
+            if (fds[i].revents & POLLIN) {
+                char buffer[BUFFER_SIZE] = {0};
+                int bytesRead = recv(fds[i].fd, buffer, BUFFER_SIZE, 0);
+
+                if (bytesRead <= 0) {
+                    std::string logEntry = "[DISCONNECT] Client FD " + std::to_string(fds[i].fd) + " left.";
+                    {
+                        std::lock_guard<std::mutex> lock(logMutex);
+                        logQueue.push(logEntry);
+                    }
+                    removeClient(fds[i].fd);
+                    fds[i] = fds[nfds - 1];
+                    nfds--;
+                    i--;
+                } else {
+                    buffer[bytesRead] = '\0';
+                    std::string msg(buffer);
+
+                    if (!msg.empty() && msg.back() == '\n')
+                        msg.pop_back();
+
+                    // Process commands
+                    if (!msg.empty() && msg[0] == '/') {
+                        processCommand(msg, fds[i].fd, clients, clientsMutex);
+                    } else {
+                        std::string senderName;
+                        int colorCode = 0;
+                        {
+                            std::lock_guard<std::mutex> lock(clientsMutex);
+                            for (auto& c : clients) {
+                                if (c.fd == fds[i].fd) {
+                                    senderName = c.name;
+                                    colorCode = c.colorCode;
+                                    break;
+                                }
+                            }
+                        }
+                        std::string coloredMsg = "\033[3" + std::to_string(colorCode) + "m" + senderName + ": " + msg + "\033[0m\n";
+
+                        std::string logEntry = "[MSG] " + senderName + ": " + msg;
+                        {
+                            std::lock_guard<std::mutex> lock(logMutex);
+                            logQueue.push(logEntry);
+                        }
+                        broadcastMessage(coloredMsg, fds[i].fd);
+                    }
+                }
+            }
+        }
     }
+
+    running = false;
+    pthread_join(logThread, nullptr);
+    close(server_fd);
+    return 0;
 }
