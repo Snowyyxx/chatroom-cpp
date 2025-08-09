@@ -1,12 +1,9 @@
 #ifndef COMMANDS_H
 #define COMMANDS_H
 
-#include "server_types.h"
 #include <string>
 #include <vector>
-#include <mutex>
 
-void processCommand(const std::string& cmd, int senderFd,
-                    std::vector<ClientInfo>& clients, std::mutex& clientsMutex);
+bool handleCommand(const std::string& msg, int clientSock, std::vector<std::string>& usersList, std::string& response);
 
 #endif
